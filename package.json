@@ -1,0 +1,46 @@
+{
+  "name": "portal",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@tanstack/react-query": "^5.90.21",
+    "@types/leaflet": "^1.9.21",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "docx": "^9.8.1",
+    "firebase": "^12.9.0",
+    "firebase-admin": "^13.6.1",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^0.563.0",
+    "mammoth": "^1.11.0",
+    "next": "^15.5.15",
+    "pdf-parse": "^2.4.5",
+    "pngjs": "^7.0.0",
+    "puppeteer": "^24.37.2",
+    "puppeteer-core": "^24.37.2",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-leaflet": "^5.0.0",
+    "recharts": "^3.7.0",
+    "tailwind-merge": "^3.4.0",
+    "transliteration": "^2.6.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "^15.5.15",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

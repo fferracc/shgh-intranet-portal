@@ -1,0 +1,743 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Helper Functions ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function getUserRole() {
+      let d = userDoc();
+      return d != null && 'role' in d.data ? d.data.role : 'guest';
+    }
+
+    // Explicit per-user feature grants, written ONLY by a super_admin.
+    // See src/lib/permissions.ts for the key list and the role defaults.
+    function grantedPerms() {
+      let d = userDoc();
+      return d != null && 'permissions' in d.data && d.data.permissions is list
+             ? d.data.permissions : [];
+    }
+
+    // ADDITIVE: a super_admin has everything; anyone else needs the explicit key.
+    // Role based access is checked by adminOr/staffOr below (role default unless switched off),
+    // so no existing account loses anything.
+    function hasPerm(p) {
+      return isSignedIn() && (getUserRole() == 'super_admin' || p in grantedPerms());
+    }
+
+    function isRoleIn(roles) {
+      return isSignedIn() && getUserRole() in roles;
+    }
+
+    function isAdmin() {
+      return isRoleIn(['admin', 'super_admin']);
+    }
+    
+    // Updated: Staff is likely a "step up" from volunteer, so we might include them in teacher logic if needed,
+    // or keep separate. For now, we define them explicitly.
+    function isStaff() {
+        return isRoleIn(['staff', 'admin', 'super_admin']);
+    }
+
+    // Role defaults a super admin switched off for one person (29 Sep 2026).
+    // Written only by a super admin; a super admin can never be denied anything.
+    function deniedPerms() {
+      let d = userDoc();
+      return d != null && 'deniedPermissions' in d.data && d.data.deniedPermissions is list
+             ? d.data.deniedPermissions : [];
+    }
+    function isDenied(p) {
+      return getUserRole() != 'super_admin' && p in deniedPerms();
+    }
+    // "role gives it, unless switched off for this person, or it was granted"
+    function adminOr(p) {
+      return (isAdmin() && !isDenied(p)) || hasPerm(p);
+    }
+    function staffOr(p) {
+      return (isStaff() && !isDenied(p)) || hasPerm(p);
+    }
+
+    // UK app admin menu: real admins plus anyone granted 'app_admin' (e.g. Prince).
+    function isAppAdmin() {
+        return adminOr('app_admin');
+    }
+
+    function isTeacher() {
+        return isRoleIn(['volunteer', 'staff']); // Assuming staff also act as teachers?
+    }
+    
+    // Line management (29 Sep 2026) is a link between two people (users/{uid}.managerId),
+    // not a role: "is the signed-in person the line manager on this record?"
+    function isLineManagerOf(managerId) {
+        return isSignedIn() && managerId == request.auth.uid;
+    }
+
+    // 'YYYY-MM-DD' of a timestamp (UTC fields).
+    function ymd(t) {
+      return string(t.year()) + '-' + (t.month() < 10 ? '0' : '') + string(t.month())
+        + '-' + (t.day() < 10 ? '0' : '') + string(t.day());
+    }
+    // The UK date is the UTC date or the date one hour later (British Summer Time).
+    function isLondonToday(d) {
+      return d == ymd(request.time) || d == ymd(request.time + duration.value(1, 'h'));
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    // --- PORTAL SPECIFIC COLLECTIONS (NEW) ---
+
+    // Leave Records
+    match /leave_records/{requestId} {
+      // The requester, their line manager, or anyone who approves all leave.
+      allow read: if isOwner(resource.data.userId)
+                  || isLineManagerOf(resource.data.get('managerId', ''))
+                  || adminOr('leave_manage');
+      // The request carries the requester's real line manager (it cannot be sent to someone else),
+      // and it always starts as pending with no decision on it (30 Sep 2026: a request could be
+      // created already approved).
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid
+                    && request.resource.data.get('managerId', '') == userDoc().data.get('managerId', '')
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.totalDays is number
+                    && request.resource.data.totalDays > 0 && request.resource.data.totalDays <= 366
+                    && !request.resource.data.keys().hasAny(['approvedBy', 'approvedAt', 'decidedBy']);
+      // 30 Sep 2026: the requester may only CANCEL their own pending request. Only the request's
+      // line manager or an Approve Leave holder decides it, once, from pending to approved or
+      // rejected, recorded under their own name. An admin with no line manager decides their own as an
+      // Approve Leave holder, as Franco asked on 29 Sep.
+      allow update: if (isOwner(resource.data.userId)
+                        && resource.data.status == 'pending' && request.resource.data.status == 'cancelled'
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt']))
+                    || ((isLineManagerOf(resource.data.get('managerId', '')) || adminOr('leave_manage'))
+                        && leaveDecision())
+                    // Franco (super admin) is never blocked: he can correct any request.
+                    || isRoleIn(['super_admin']);
+    }
+
+    function leaveDecision() {
+      return resource.data.status == 'pending'
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.approvedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'approvedAt', 'approvedBy', 'rejectionReason']);
+    }
+
+    // Policy Tracking (User read receipts)
+    match /policy_tracking/{trackId} {
+      // Line managers see their team's reading through the teamOverview function.
+      allow read: if isOwner(resource.data.userId) || isAdmin();
+      allow create: if isOwner(request.resource.data.userId); 
+    }
+
+    // TOIL Bank
+    match /toil_bank/{entry} {
+      allow read: if isOwner(resource.data.userId) || isAdmin();
+      allow write: if isAdmin(); 
+    }
+    
+    // Recruitment
+    // Volunteer applications (25 Sep 2026). The public form at /volunteer (no login) may
+    // only CREATE an application with the known answers; it can never read, change or
+    // delete one. Ethnicity and disability go in private/equality.
+    match /volunteer_applications/{appId} {
+      allow read, update, delete: if adminOr('volunteer_applications');
+      allow create: if volunteerFormOpen() && validVolunteerApplication(appId, request.resource.data);
+
+      match /private/{docId} {
+        allow read, update, delete: if adminOr('volunteer_applications');
+        allow create: if docId == 'equality'
+          && existsAfter(/databases/$(database)/documents/volunteer_applications/$(appId))
+          && request.resource.data.keys().hasOnly(['nationality', 'ethnicity', 'ethnicityOther', 'disability', 'answers'])
+          // Options are edited in the form editor (29 Sep 2026), so only types and sizes are checked here.
+          && shortStr(request.resource.data, 'nationality', 80) && shortStr(request.resource.data, 'ethnicity', 200)
+          && shortStr(request.resource.data, 'disability', 200) && shortStr(request.resource.data, 'ethnicityOther', 120)
+          && smallMap(request.resource.data, 'answers', 60);
+      }
+    }
+
+    function volunteerFormOpen() {
+      return !exists(/databases/$(database)/documents/settings/volunteerForm)
+        || get(/databases/$(database)/documents/settings/volunteerForm).data.get('open', true) != false;
+    }
+
+    // Maps the form editor fills (29 Sep 2026): questions added by a super admin (answers)
+    // and the wording the applicant saw (labels). Sizes are capped; values are not typed.
+    function smallMap(d, k, max) {
+      return !(k in d) || (d[k] is map && d[k].size() <= max);
+    }
+
+    // The questions are edited at /recruitment/forms (29 Sep 2026), so option lists are no
+    // longer fixed here: the rule checks the keys, the types and the sizes.
+    function validVolunteerApplication(appId, d) {
+      return d.keys().hasOnly(['name', 'email', 'phone', 'age', 'gender', 'role', 'heardFrom', 'heardFromOther',
+             'motivations', 'motivationText', 'availability', 'cvPath', 'cvName', 'consent', 'status', 'submittedAt',
+             'answers', 'labels'])
+        && d.status == 'new' && d.consent == true && d.submittedAt == request.time
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 120
+        && d.email is string && d.email.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$') && d.email.size() <= 150
+        && shortStr(d, 'phone', 30) && shortStr(d, 'age', 3)
+        && shortStr(d, 'gender', 200) && shortStr(d, 'role', 200) && shortStr(d, 'heardFrom', 200) && shortStr(d, 'heardFromOther', 120)
+        && smallMap(d, 'motivations', 40)
+        && smallMap(d, 'availability', 7)
+        && (!('availability' in d) || d.availability.keys().hasOnly(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']))
+        && shortStr(d, 'motivationText', 3000)
+        && smallMap(d, 'answers', 60) && smallMap(d, 'labels', 10)
+        && (!('cvPath' in d) || d.cvPath == 'volunteerCVs/' + appId + '/cv.pdf')
+        && shortStr(d, 'cvName', 120);
+    }
+
+    // Emails the portal asks the server to send from recruitment@sovereignhousegh.com.
+    // 30 Sep 2026: only people with Volunteer Applications read these (they hold applicants'
+    // private copies), and a person may only queue an email about a real volunteer application,
+    // as themselves, from the recruitment address. Leave emails go to systemMail instead.
+    match /mail/{mailId} {
+      allow read: if adminOr('volunteer_applications');
+      allow create: if adminOr('volunteer_applications') && validRecruitmentMail(request.resource.data);
+      allow update, delete: if isAdmin();
+    }
+    // Emails the server writes for itself (leave requests and decisions). No browser reads them.
+    match /systemMail/{mailId} {
+      allow read: if isRoleIn(['super_admin']);
+      allow write: if false;
+    }
+    function validRecruitmentMail(d) {
+      return d.keys().hasOnly(['to', 'cc', 'subject', 'html', 'text', 'ics', 'icsName', 'kind', 'applicationId', 'from', 'status', 'createdBy', 'createdAt'])
+        && d.status == 'queued'
+        && d.from == 'recruitment@sovereignhousegh.com'
+        && d.createdBy == request.auth.uid
+        && d.kind in ['interview', 'declined', 'welcome']
+        && d.applicationId is string
+        && exists(/databases/$(database)/documents/volunteer_applications/$(d.applicationId))
+        && d.to is list && d.to.size() > 0 && d.to.size() <= 10
+        && (!('cc' in d) || (d.cc is list && d.cc.size() <= 20))
+        && d.subject is string && d.subject.size() <= 300
+        && d.text is string && d.text.size() <= 20000
+        && d.html is string && d.html.size() <= 40000;
+    }
+    // Which Microsoft 365 app sends the mail (tenant and client id; the secret is not here).
+    match /mailConfig/{docId} {
+      allow read, write: if isRoleIn(['super_admin']);
+    }
+    // Open or close the public volunteer form.
+    match /settings/volunteerForm {
+      allow write: if adminOr('volunteer_applications');
+    }
+    // The editable application forms (29 Sep 2026): public pages read them, only a super admin changes them.
+    match /formTemplates/{formId} {
+      allow read: if true;
+      allow write: if isRoleIn(['super_admin'])
+        && formId in ['volunteer', 'children', 'adults', 'refugees', 'referral']
+        && request.resource.data.questions is list && request.resource.data.questions.size() <= 80;
+    }
+
+    // Line management settings (29 Sep 2026): the default line manager for new people.
+    // managerId on a user is only changed by a super admin (see the users block).
+    match /lineManagement/{docId} {
+      allow read: if isSignedIn();
+      allow write: if isRoleIn(['super_admin']);
+    }
+
+    // Who is emailed about every new volunteer application (29 Sep 2026). Not public.
+    match /recruitmentSettings/{docId} {
+      // studentAlerts (1 Oct 2026): who is told about new student applications.
+      allow read: if (docId == 'studentAlerts' && adminOr('student_applications'))
+                  || (docId != 'studentAlerts' && adminOr('volunteer_applications'));
+      allow write: if ((docId == 'studentAlerts' && adminOr('student_applications'))
+                    || (docId != 'studentAlerts' && adminOr('volunteer_applications')))
+        && request.resource.data.keys().hasOnly(['emails', 'extra', 'updatedBy', 'updatedAt'])
+        && request.resource.data.emails is list && request.resource.data.emails.size() <= 20
+        && request.resource.data.extra is list && request.resource.data.extra.size() <= 20;
+    }
+
+    match /applicationProcesses/{procId} {
+      allow read, create: if adminOr('student_applications');
+      // 6 Oct 2026: "delete" is ARCHIVE, by the super admin only; nothing is deleted from the page
+      // (the delete below is for the super admin's clean-up of the old Form Links entries).
+      allow update: if adminOr('student_applications')
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['archived', 'archivedAt', 'archivedBy', 'archivedByName'])
+            || isRoleIn(['super_admin']));
+      allow delete: if isRoleIn(['super_admin']);
+      // Portal-hosted forms (25 Sep 2026): the public form page may read ONE open
+      // process that has a formType, so it knows which questions to show.
+      allow get: if resource.data.get('formType', '') != '' && resource.data.status == 'Open';
+
+      // Answers to a portal form. Anyone (no login) may CREATE one, only for an open
+      // portal form, only with the known fields, and never read, change or delete.
+      // Keep the key list in step with APPLICATION_ALLOWED_KEYS in src/lib/applicationForms.ts.
+      // 6 Oct 2026: the super admin may also create one, to move applications from the old
+      // refugees-appform database (they carry importedFrom, and the server sends no email for them).
+      // Applications are never deleted from the page (archive instead); delete stays for the super admin.
+      match /submissions/{subId} {
+        allow read, update: if adminOr('student_applications');
+        allow delete: if isRoleIn(['super_admin']);
+        allow create: if validSubmission(procId, request.resource.data)
+          || (isRoleIn(['super_admin']) && request.resource.data.get('importedFrom', '') is string
+              && request.resource.data.get('importedFrom', '') != '');
+      }
+    }
+
+    function shortStr(d, k, max) {
+      return !(k in d) || (d[k] is string && d[k].size() <= max);
+    }
+
+    function validSubmission(procId, d) {
+      let proc = get(/databases/$(database)/documents/applicationProcesses/$(procId)).data;
+      return proc.get('formType', '') != ''
+        && proc.status == 'Open'
+        && proc.get('archived', false) != true
+        && (proc.get('closesAt', null) == null || request.time <= proc.closesAt)
+        && d.formType == proc.formType
+        && d.processId == procId
+        && d.status == 'New'
+        && d.consent == true
+        && d.submittedAt == request.time
+        && d.keys().hasOnly(['processId', 'formType', 'status', 'submittedAt', 'consent',
+             'programme', 'name', 'dob', 'yearClass', 'gender', 'school', 'parentName', 'parentPhone',
+             'address', 'postcode', 'mobile', 'email', 'emergencyContactName', 'emergencyContactPhone',
+             'emergencyContact', 'nationality', 'itLevel', 'age', 'answers', 'labels'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 120
+        && shortStr(d, 'programme', 200) && shortStr(d, 'dob', 10) && shortStr(d, 'yearClass', 60)
+        && shortStr(d, 'gender', 200) && shortStr(d, 'school', 150) && shortStr(d, 'parentName', 120)
+        && shortStr(d, 'parentPhone', 30) && shortStr(d, 'address', 300) && shortStr(d, 'postcode', 12)
+        && shortStr(d, 'mobile', 30) && shortStr(d, 'email', 150) && shortStr(d, 'emergencyContactName', 120)
+        && shortStr(d, 'emergencyContactPhone', 30) && shortStr(d, 'emergencyContact', 160)
+        && shortStr(d, 'nationality', 80) && shortStr(d, 'itLevel', 200) && shortStr(d, 'age', 3)
+        && smallMap(d, 'answers', 60) && smallMap(d, 'labels', 10);
+    }
+
+    // --- EXISTING COLLECTIONS (From User's Rules + Updates) ---
+
+    match /users/{userId} {
+      // TODO (after every phone runs app 2026.10.01 or later): tighten get/list to the owner,
+      // staff and above, volunteers/app_admin/leave_manage holders and the line manager; volunteers
+      // then read publicProfiles. See project memory "people and directory".
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+
+      // 1 Oct 2026: updatedBy (read by the change log) is always the person writing.
+      function stampOk() {
+        return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['updatedBy', 'updatedAt'])
+               || request.resource.data.get('updatedBy', '') == request.auth.uid;
+      }
+
+      // A user may only create their OWN profile, and only with no privileges.
+      allow create: if request.resource.data.get('updatedBy', request.auth.uid) == request.auth.uid
+                    && ((isOwner(userId)
+                        && request.resource.data.role == 'standard_user'
+                        && !request.resource.data.keys().hasAny(['permissions', 'deniedPermissions', 'leaveAllowance', 'managerId', 'archived']))
+                    || isRoleIn(['super_admin'])
+                    || (isAdmin() && !('permissions' in request.resource.data) && !('deniedPermissions' in request.resource.data)));
+
+      // role, permissions, deniedPermissions and managerId are privileged: ONLY a super_admin.
+      allow update: if stampOk() && (
+                       isRoleIn(['super_admin'])
+                    || ((adminOr('volunteers'))
+                        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'permissions', 'deniedPermissions', 'managerId', 'leaveAllowance', 'archived', 'archivedAt', 'archivedBy']))
+                    // Accepting a volunteer application copies these answers onto the new profile.
+                    || (adminOr('volunteer_applications') && userId != request.auth.uid
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['phone', 'age', 'gender', 'volunteerRole', 'availability', 'applicationId', 'updatedBy', 'updatedAt']))
+                    // The leave balance: the person's line manager or an Approve Leave holder. On their
+                    // OWN record (an admin with no line manager approving their own leave) only a deduction is allowed.
+                    || ((isLineManagerOf(resource.data.get('managerId', '')) || adminOr('leave_manage'))
+                        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['leaveAllowance', 'updatedBy', 'updatedAt'])
+                        && (userId != request.auth.uid
+                            || (request.resource.data.leaveAllowance.total == resource.data.leaveAllowance.total
+                                && request.resource.data.leaveAllowance.get('entitlement', 0) == resource.data.leaveAllowance.get('entitlement', 0)
+                                && request.resource.data.leaveAllowance.remaining < resource.data.leaveAllowance.remaining)))
+                    // Nobody may change their own leave balance, privileges or archive state.
+                    || (isOwner(userId)
+                        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'permissions', 'deniedPermissions', 'dbsCheck', 'managerId', 'leaveAllowance', 'archived', 'archivedAt', 'archivedBy'])));
+
+      allow delete: if isRoleIn(['super_admin']);
+    }
+
+    // Name, photo and role of everyone, mirrored by the server (1 Oct 2026).
+    match /publicProfiles/{userId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    // Which app version each person last opened (1 Oct 2026). Written by the UK app after
+    // sign-in, one document per person. Used to know when every phone runs an app that reads
+    // publicProfiles, before the users read rule above is tightened. Admins read it.
+    match /appSeen/{userId} {
+      allow read: if isAdmin();
+      allow create, update: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['version', 'platform', 'at'])
+        && request.resource.data.version is string
+        && request.resource.data.version.size() <= 40
+        && request.resource.data.platform in ['app', 'web']
+        && request.resource.data.at == request.time;
+      allow delete: if false;
+    }
+
+    // Who changed roles, permissions, line managers, archive and entitlements (server written).
+    match /changeLog/{entryId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /students/{studentId} {
+      allow read, list: if isSignedIn();
+      allow create: if isSignedIn(); // Kept user's original rule
+      allow write: if staffOr('students');
+      // Accepting a student application onto an existing record (1 Oct 2026).
+      allow update: if adminOr('student_applications')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name','email','postcode','age','mobile','itLevel','languageUsed','applicationId','applicationAnswers','programme','yearClass','gender','school','parentName','parentPhone','address','emergencyContactName','emergencyContactPhone','emergencyContact']);
+    }
+
+    // Safeguarding details split out of /students (phase 1, 24 Sep 2026). Same document id
+    // as the student. Only staff/admin and people granted the 'students' permission can
+    // read or write it; ordinary volunteers cannot. Same pattern as the Ghana app's
+    // studentsPrivate (8 Sep). Phase 2 (24 Sep): portal and UK app write both places and read
+    // /students first, then this. Phase 3 removes the five fields from /students.
+    match /studentsPrivate/{studentId} {
+      allow read, list: if staffOr('students');
+      // Anyone signed in may CREATE the private copy of a new student (teachers add
+      // students in the UK app) but cannot read it back or change an existing one.
+      allow create: if isSignedIn();
+      // student_applications: converting an application into a student writes the private copy
+      allow update: if staffOr('students') || adminOr('student_applications');
+      allow delete: if staffOr('students');
+    }
+
+    match /course/{courseId} {
+      allow read, list: if isSignedIn();
+      allow write: if staffOr('courses');
+    }
+    
+    match /courseAssignments/{assignmentId} {
+      allow read, list: if isSignedIn();
+      allow create: if isSignedIn();
+      allow write: if staffOr('courses');
+    }
+    
+    match /courseRoster/{rosterId} {
+      allow read, list: if isSignedIn();
+      allow create: if isSignedIn();
+      allow write: if staffOr('courses');
+    }
+    
+    // Registers (30 Sep 2026, Franco): a register can be TAKEN for any date (phones that were
+    // offline upload later), but CHANGED (tick added later is a create; untick or edit is an
+    // update/delete) only on the class date, UK time. After that only the super admin.
+    // A record with held: true and no student or teacher means "class held, nobody came".
+    match /attendanceRecords/{recordId} {
+      allow read, list: if isSignedIn();
+      allow create: if isRoleIn(['volunteer', 'staff', 'admin', 'super_admin'])
+                    && request.resource.data.courseId is string
+                    && request.resource.data.date is string && request.resource.data.date.size() == 10;
+      allow update, delete: if isRoleIn(['super_admin'])
+                    || (isRoleIn(['volunteer', 'staff', 'admin']) && isLondonToday(resource.data.get('date', '')));
+    }
+ 
+    // Class reports: every report is kept. The author may edit their report on the class
+    // date (UK time); after that only the super admin. Nobody else deletes one.
+    match /classRecords/{recordId} {
+      allow read, list: if isSignedIn();
+      allow create: if isRoleIn(['volunteer', 'staff', 'admin', 'super_admin']);
+      allow update: if isRoleIn(['super_admin'])
+                    || (resource.data.get('volunteerId', '') == request.auth.uid
+                        && isLondonToday(resource.data.get('date', ''))
+                        && request.resource.data.volunteerId == resource.data.volunteerId
+                        && request.resource.data.date == resource.data.date);
+      allow delete: if isRoleIn(['super_admin']);
+    }
+
+    match /volunteerActivities/{activityId} {
+        allow get: if adminOr('volunteers') || resource.data.volunteerId == request.auth.uid;
+        allow list: if isSignedIn();
+        allow create: if request.resource.data.volunteerId == request.auth.uid;
+        allow update: if staffOr('volunteers');
+        allow delete: if adminOr('volunteers');
+    }
+    
+    match /messages/{messageId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    match /adminMessages/{messageId} {
+        allow read, write: if isAppAdmin();
+    }
+
+    // Announcements (fixed 2026-09-24). The page used to write to adminMessages
+    // while the dashboard read announcements, which had no rule, so no one ever
+    // saw an announcement. Everyone signed in reads; only 'announcements' posts.
+    match /announcements/{announcementId} {
+      allow read, list: if isSignedIn();
+      allow create: if (adminOr('announcements'))
+                    && request.resource.data.title is string
+                    && request.resource.data.title.size() > 0
+                    && request.resource.data.content is string;
+      allow update, delete: if adminOr('announcements');
+    }
+
+    match /teacherMessages/{messageId} {
+        allow read, write: if isTeacher() || isRoleIn(['super_admin']);
+    }
+
+    match /directMessages/{chatKey}/messages/{messageId} {
+      allow read, write: if isSignedIn() && request.auth.uid in chatKey.split('-');
+    }
+
+    match /chatSessions/{sessionId} {
+      allow read, create, update: if isSignedIn() && (
+            sessionId == 'group' ||
+            (sessionId == 'admins' && isAppAdmin()) ||
+            (sessionId == 'teachers' && (isTeacher() || isRoleIn(['super_admin']))) ||
+            (resource.data != null && request.auth.uid in resource.data.participants) ||
+            (request.resource.data != null && request.auth.uid in request.resource.data.participants)
+        );
+    }
+    
+    // Explicit rule for 'resources' since app uses it
+    match /resources/{resourceId} {
+      allow read, list: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // 30 Sep 2026: only admins and the super admin manage policies.
+    match /policyResources/{docId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin()
+        && request.resource.data.get('audience', 'everyone') in ['staff', 'volunteers', 'everyone'];
+      allow delete: if isAdmin();
+    }
+    // 30 Sep 2026: only admins and the super admin manage policies.
+    match /PolicyResources/{docId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin()
+        && request.resource.data.get('audience', 'everyone') in ['staff', 'volunteers', 'everyone'];
+      allow delete: if isAdmin();
+    }
+
+    match /readConfirmations/{confirmationId} {
+      allow read, list: if isAdmin() || adminOr('volunteers') || isAppAdmin() || isOwner(resource.data.volunteerId);
+      allow create: if isOwner(request.resource.data.volunteerId);
+    }
+
+    match /achievementsBadges/{badgeId} {
+      allow read, list: if isSignedIn();
+      allow write: if adminOr('badges');
+    }
+    
+    match /earnedAchievements/{earnedId} {
+        allow get, list: if isSignedIn();
+        // 30 Sep 2026: written only by the server (automatic awards, awardBadgeByHand,
+        // withdrawHandBadge), so nobody can give themselves a badge or remove one.
+        allow create, update, delete: if false;
+    }
+
+    // Saved report selections of the Statistics page (30 Sep 2026).
+    match /reportTemplates/{templateId} {
+      allow read: if adminOr('statistics');
+      allow create: if adminOr('statistics')
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+        && request.resource.data.selection is map;
+      allow update: if adminOr('statistics') && request.resource.data.createdBy == resource.data.createdBy;
+      allow delete: if adminOr('statistics');
+    }
+    
+    match /absences/{absenceId} {
+      allow get: if adminOr('volunteers') || isOwner(resource.data.volunteerId);
+      allow list: if isSignedIn();
+      allow create: if isOwner(request.resource.data.volunteerId);
+      allow update, delete: if adminOr('volunteers');
+    }
+
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isRoleIn(['super_admin']);
+    }
+
+    // Portal Dashboard needs read access for all signed in users
+    // Laptop PINs live here, so reading is limited to people who work with the
+    // inventory (25 Sep 2026; it used to be every signed-in user).
+    // 30 Sep 2026 (Franco): anyone with the Inventory permission (staff by default) may change
+    // the inventory, not only admins. Donated and wasted items no longer carry a PIN and are
+    // no longer readable by every signed-in account.
+    match /laptopInventory/{itemId} {
+      allow read, list: if staffOr('inventory');
+      allow create, write, delete: if staffOr('inventory');
+    }
+    
+    match /donatedInventory/{itemId} {
+      allow read, list: if staffOr('inventory');
+      allow create: if staffOr('inventory') && !('pin' in request.resource.data);
+      allow update: if staffOr('inventory') && !('pin' in request.resource.data);
+      allow delete: if staffOr('inventory');
+    }
+    
+    match /wastedInventory/{itemId} {
+      allow read, list: if staffOr('inventory');
+      allow create: if staffOr('inventory') && !('pin' in request.resource.data);
+      allow update: if staffOr('inventory') && !('pin' in request.resource.data);
+      allow delete: if staffOr('inventory');
+    }
+    
+    match /inventorySettings/{settingId} {
+      allow read, list: if isSignedIn(); 
+      allow create, write, delete: if staffOr('inventory');
+    }
+
+    match /counters/{counterId} {
+        allow read: if isSignedIn();
+        allow write: if isAdmin();
+        // The course code counter moves whenever someone who may create courses creates one.
+        allow update, create: if counterId == 'courseCounter' && (staffOr('courses'));
+    }
+
+    // 1-2-1 courses (25 Sep 2026): each meeting between a volunteer and one person is
+    // a session with notes instead of attendance. Notes can be personal, so a volunteer
+    // sees only their own sessions; staff, admins and 'courses'/'app_admin' see all.
+    match /oneToOneSessions/{sessionId} {
+      function seesAll() { return staffOr('courses') || isAppAdmin(); }
+      allow read: if isSignedIn() && (seesAll() || resource.data.volunteerId == request.auth.uid);
+      allow create: if isSignedIn()
+        && request.resource.data.volunteerId == request.auth.uid
+        && request.resource.data.courseId is string
+        && request.resource.data.studentId is string
+        && request.resource.data.date is string && request.resource.data.date.size() == 10
+        && request.resource.data.durationMinutes is number
+        && request.resource.data.durationMinutes > 0 && request.resource.data.durationMinutes <= 600
+        && request.resource.data.topic is string && request.resource.data.topic.size() <= 200
+        && request.resource.data.get('notes', '').size() <= 2000
+        && request.resource.data.get('followUp', '').size() <= 1000;
+      allow update, delete: if isSignedIn() && (seesAll() || resource.data.volunteerId == request.auth.uid);
+    }
+    
+    // Session Reports
+    match /session_reports/{reportId} {
+       allow read: if isSignedIn();
+       allow write: if staffOr('courses');
+    }
+    // Grants (Funding Module)
+    match /grants/{grantId} {
+      allow read, write: if adminOr('grants');
+    }
+
+    // --- Social Media Studio ---
+    // Only admins and super_admins may see or touch social content, per
+    // Franco's instruction: staff and volunteers see nothing at all.
+    //
+    // n8n bypasses these rules because it authenticates with a service
+    // account. That is necessary and intentional — it performs the
+    // published/postId transitions that no human should be able to make.
+
+    function isSocialApprover() {
+      return adminOr('social_media');
+    }
+
+    // 7 Oct 2026: the result of the twice-daily connection check (n8n sm-health writes it with
+    // the service account). Shown on the Social Media page; nobody writes it from a browser.
+    match /socialHealth/{docId} {
+      allow read: if isSocialApprover();
+      allow write: if false;
+    }
+
+    match /socialBriefs/{briefId} {
+      allow read, create: if isSocialApprover();
+      // A brief is the record of what was asked for. It is never edited or
+      // deleted, so the trail from request to published post stays intact.
+      allow update, delete: if false;
+    }
+
+    match /socialPosts/{postId} {
+      allow read: if isSocialApprover();
+      // Always a draft with no approval or consent recorded (New post, Write with AI, Duplicate).
+      allow create: if isSocialApprover()
+        && request.resource.data.status == 'draft'
+        && request.resource.data.approvedByUid == ''
+        && request.resource.data.personConsentByUid == ''
+        && request.resource.data.get('archived', false) == false;
+
+      allow update: if isSocialApprover() && (
+        // editing a draft: a draft never carries an approval
+        (resource.data.status == 'draft' && request.resource.data.status == 'draft'
+          && request.resource.data.get('approvedByUid', '') == '')
+        ||
+        // approving: the approver must be the caller
+        (resource.data.status == 'draft'
+          && request.resource.data.status == 'approved'
+          && request.resource.data.approvedByUid == request.auth.uid)
+        ||
+        // an approved post staying approved. Approval, picture and consent never change.
+        // Either 'Publish now' or a new time, or an edit of text, time and network recorded
+        // as the caller (1 Oct 2026).
+        (resource.data.status == 'approved'
+          && request.resource.data.status == 'approved'
+          && request.resource.data.approvedByUid == resource.data.approvedByUid
+          && request.resource.data.get('mediaUrl', '') == resource.data.get('mediaUrl', '')
+          && request.resource.data.get('containsPerson', false) == resource.data.get('containsPerson', false)
+          && request.resource.data.get('personConsentByUid', '') == resource.data.get('personConsentByUid', '')
+          && request.resource.data.get('personConsentByName', '') == resource.data.get('personConsentByName', '')
+          && (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['publishNow', 'scheduledFor', 'updatedAt'])
+              || (request.resource.data.get('editedBy', '') == request.auth.uid
+                  && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['copy', 'network', 'scheduledFor', 'publishNow', 'editedBy', 'editedByUid', 'editedByName', 'editedAt', 'updatedAt']))))
+        ||
+        // back to draft: failed, blocked, refused or rejected posts, approval and consent cleared
+        (resource.data.status in ['failed', 'blockedSafeguarding', 'rejected', 'refused']
+          && request.resource.data.status == 'draft'
+          && request.resource.data.approvedByUid == ''
+          && request.resource.data.get('personConsentByUid', '') == '')
+        ||
+        // requesting a takedown of something already published (unchanged)
+        (resource.data.status == 'published'
+          && request.resource.data.status == 'published'
+          && request.resource.data.takedownRequested == true
+          && request.resource.data.takedownByUid == request.auth.uid
+          && request.resource.data.takedownReason is string
+          && request.resource.data.takedownReason.size() > 0)
+        ||
+        // rejecting anything that has not gone out
+        (resource.data.status in ['draft', 'approved', 'refused', 'blockedSafeguarding', 'failed']
+          && request.resource.data.status == 'rejected')
+        ||
+        // archive or restore, on any status, changing nothing else
+        (request.resource.data.status == resource.data.status
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['archived', 'archivedAt', 'archivedByUid', 'archivedByName'])
+          && request.resource.data.archived is bool)
+      );
+
+      // Posts are rejected, archived or taken down, never erased.
+      allow delete: if false;
+    }
+
+    // The annual plan. One document per year, id = the year. It is read by the
+    // studio and by the socialDrafts function, and its neverPost list becomes a
+    // hard constraint in the generation prompt — so write access is the same
+    // admin-only gate as the posts themselves.
+    match /socialStrategy/{year} {
+      allow read: if isSocialApprover();
+      allow create, update: if isSocialApprover()
+        && request.resource.data.updatedByUid == request.auth.uid;
+      // A superseded plan is history worth keeping. Revise it, never erase it.
+      allow delete: if false;
+    }
+
+    // Written only by n8n, using the service account, which bypasses these rules.
+    // Approvers read it so the page can say how much of the Upload-Post monthly
+    // allowance is left. No client may write it: a figure the browser can edit is
+    // a figure nobody can trust.
+    match /socialQuota/{docId} {
+      allow read: if isSocialApprover();
+      allow write: if false;
+    }
+
+    // Statistics (Aggregated Data)
+    match /statistics/{statId} {
+      allow read: if isStaff();
+      allow write: if isAdmin(); // System mostly writes this, but admin could
+    }
+  }
+}

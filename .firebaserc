@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "shgh-lms1"
+  },
+  "targets": {
+    "shgh-lms1": {
+      "hosting": {
+        "portal": [
+          "shgh-portal"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}
